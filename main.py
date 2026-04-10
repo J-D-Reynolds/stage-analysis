@@ -14,6 +14,56 @@ def get_sp500_tickers():
     tickers = sorted([t.replace('.', '-') for t in tickers])
     return tickers
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def run_screener(tickers):
+    # Batch download 3 years of context for severe base calculations
+    df = yf.download(tickers, period="3y", interval="1d", group_by="ticker", progress=False, threads=True)
+    
+    passed_tickers = []
+    for t in tickers:
+        try:
+            # Extract safe single-ticker chunk
+            t_df = df[t].copy() if len(tickers) > 1 else df.copy()
+            t_df = t_df.dropna(subset=['Close'])
+            
+            if len(t_df) < 200:
+                continue
+                
+            max_close_3y = t_df['Close'].max()
+            current_close = t_df['Close'].iloc[-1]
+            
+            # Condition 1: Severe Decline (>35% structural drop off highs)
+            if current_close > (max_close_3y * 0.65):
+                continue
+                
+            # Heavy calculation parameters
+            t_df['150_DMA'] = t_df['Close'].rolling(window=150).mean()
+            t_df['150_DMA_slope'] = t_df['150_DMA'].diff(20)
+            
+            # Condition 2: Deep Consolidation (The base must legally be "flat" for majority of last 100 days)
+            flat_mask = (t_df['150_DMA_slope'] > -(t_df['Close'] * 0.03)) & (t_df['150_DMA_slope'] < (t_df['Close'] * 0.05))
+            if flat_mask.tail(100).sum() < 60: # 60% of the last 4 months were cleanly flatlined
+                continue
+                
+            # Condition 3: Spring Breakout logic triggered recently
+            near_ma = (t_df['Close'] > t_df['150_DMA']) & (t_df['Close'] < (t_df['150_DMA'] * 1.15))
+            t_df['20_StdDev'] = t_df['Close'].rolling(window=20).std()
+            t_df['100_Avg_StdDev'] = t_df['20_StdDev'].rolling(window=100).mean()
+            vol_contraction = t_df['20_StdDev'].shift(1) < (t_df['100_Avg_StdDev'].shift(1) * 0.8)
+            t_df['20_Day_High'] = t_df['High'].rolling(window=20).max().shift(1)
+            breakout = t_df['Close'] > t_df['20_Day_High']
+            
+            spring_triggered = flat_mask & near_ma & vol_contraction & breakout
+            
+            # Identify if it actively jumped within the past 4-5 trading days
+            if spring_triggered.tail(5).any():
+                passed_tickers.append(t)
+                
+        except Exception:
+            continue
+            
+    return passed_tickers
+
 # Set page layout to wide and dark mode (Streamlit defaults to matching system, but we configure layout)
 st.set_page_config(
     page_title="Algorithmic Trading Dashboard",
@@ -40,7 +90,27 @@ with st.sidebar:
         ticker = ticker_choice
         
     period = st.selectbox("Visual Time Period", options=["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"], index=3)
-    st.button("Deploy Strategy", type="primary")
+
+    st.markdown("---")
+    st.subheader("🔍 Deep Value Screener")
+    st.caption("Scans all S&P 500 stocks for long Stage 1 bases following severe Stage 4 declines, with a recent uptrend breakout trigger.")
+    
+    if st.button("▶ Run Screener", use_container_width=True, type="primary"):
+        with st.spinner("Scanning 500 stocks... (~20-30 seconds)"):
+            results = run_screener(tuple(sp500_options))
+        
+        if results:
+            st.success(f"✅ Found **{len(results)}** Stage 1 Breakout Setup{'s' if len(results) > 1 else ''}!")
+            for r in results:
+                if st.button(f"📈 {r}", key=f"screener_{r}", use_container_width=True):
+                    st.session_state['selected_ticker'] = r
+            st.caption("Click a ticker above to load it in the chart →")
+        else:
+            st.info("No qualifying setups found today. Check back after next market session.")
+
+# Handle screener ticker selection via session state
+if 'selected_ticker' in st.session_state:
+    ticker = st.session_state['selected_ticker']
 
 st.title(f"{ticker} / USD - Interactive Chart")
 
@@ -71,6 +141,27 @@ def load_data(ticker):
         
         # Tag contiguous blocks so Plotly can draw distinct background rectangles
         df['Stage_Group'] = (df['Stage'] != df['Stage'].shift(1)).cumsum()
+        
+        # --- Stage 1 Spring Breakout Logic ---
+        # 1. Base Condition: 150-DMA is relatively flat 
+        flat_base = (df['150_DMA_slope'] > -(df['Close'] * 0.03)) & (df['150_DMA_slope'] < (df['Close'] * 0.05))
+        
+        # 2. Location: Price is crossing or resting just above the 150-DMA (within 15%)
+        near_ma = (df['Close'] > df['150_DMA']) & (df['Close'] < (df['150_DMA'] * 1.15))
+        
+        # 3. Volatility Contraction: 20-day Standard Deviation tightness
+        df['20_StdDev'] = df['Close'].rolling(window=20).std()
+        df['100_Avg_StdDev'] = df['20_StdDev'].rolling(window=100).mean()
+        # Check if yesterday's volatility was extremely pinched (tight consolidation)
+        vol_contraction = df['20_StdDev'].shift(1) < (df['100_Avg_StdDev'].shift(1) * 0.8)
+        
+        # 4. Breakout Trigger: Price surges above its recent 20-day local high
+        df['20_Day_High'] = df['High'].rolling(window=20).max().shift(1)
+        breakout = df['Close'] > df['20_Day_High']
+        
+        # Combine all conditions into exact Buy Points
+        df['Buy_Spring'] = flat_base & near_ma & vol_contraction & breakout
+        
     return df
 
 with st.spinner(f"Fetching data for {ticker}..."):
@@ -174,6 +265,17 @@ else:
                 borderwidth=1,
                 borderpad=4
             )
+
+    # Add Stage 1 "Spring" Buy Point visualization indicators!
+    spring_df = df[df['Buy_Spring'] == True]
+    if not spring_df.empty:
+        fig.add_trace(go.Scatter(
+            x=spring_df.index,
+            y=spring_df['Low'] * 0.94, # Position the arrow slightly underneath the daily low shadow
+            mode='markers',
+            name='Spring Entry',
+            marker=dict(symbol='triangle-up', size=16, color='#2962ff', line=dict(width=1, color='white'))
+        ))
 
     # Customize the layout for a premium dark-mode TradingView feel
     fig.update_layout(

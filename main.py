@@ -3,6 +3,17 @@ import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
 
+@st.cache_data(ttl=86400) # strictly cache for 1 day
+def get_sp500_tickers():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    # Wikipedia blocks default python agents, so we spoof a standard browser via storage_options
+    tables = pd.read_html(url, storage_options={'User-Agent': 'Mozilla/5.0'})
+    df = tables[0]
+    tickers = df['Symbol'].tolist()
+    # Clean tickers for yfinance compatibility (e.g. BRK.B -> BRK-B)
+    tickers = sorted([t.replace('.', '-') for t in tickers])
+    return tickers
+
 # Set page layout to wide and dark mode (Streamlit defaults to matching system, but we configure layout)
 st.set_page_config(
     page_title="Algorithmic Trading Dashboard",
@@ -16,8 +27,12 @@ with st.sidebar:
     st.title("Antigravity Trading")
     
     # Stock Choice
-    stock_options = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "SPY", "QQQ", "BTC-USD", "Custom..."]
-    ticker_choice = st.selectbox("Select Ticker", options=stock_options, index=0)
+    sp500_options = get_sp500_tickers()
+    stock_options = sp500_options + ["Custom..."]
+    
+    # Safely assign AAPL as the default selection
+    default_index = stock_options.index("AAPL") if "AAPL" in stock_options else 0
+    ticker_choice = st.selectbox("Select S&P 500 Ticker", options=stock_options, index=default_index)
     
     if ticker_choice == "Custom...":
         ticker = st.text_input("Enter Custom Ticker", value="AMD").upper()
@@ -129,6 +144,36 @@ else:
             fillcolor=color, opacity=1,
             layer="below", line_width=0,
         )
+        
+        # Calculate & display trade metrics for Stage 2 Runs!
+        if stage_num == 2:
+            entry_price = group['Close'].iloc[0]
+            exit_price = group['Close'].iloc[-1]
+            profit_pct = ((exit_price - entry_price) / entry_price) * 100
+            
+            time_in_days = (end_date - start_date).days
+            
+            # Position at the center-date of the block
+            mid_index = int(len(group) / 2)
+            mid_date = group.index[mid_index]
+            
+            # Color logic
+            profit_color = "#26a69a" if profit_pct >= 0 else "#ef5350"
+            profit_sign = "+" if profit_pct > 0 else ""
+            
+            metrics_html = f"<span style='color:{profit_color}; font-weight:bold;'>{profit_sign}{profit_pct:.1f}%</span><br><span style='color:#a3a6af; font-size:11px;'>{time_in_days}d</span>"
+            
+            fig.add_annotation(
+                x=mid_date,
+                y=0.02, # Stick it beautifully right near the bottom X axis timeline
+                yref="paper",
+                text=metrics_html,
+                showarrow=False,
+                bgcolor="rgba(0,0,0,0.6)", # dark glassmorphism
+                bordercolor="rgba(255,255,255,0.1)",
+                borderwidth=1,
+                borderpad=4
+            )
 
     # Customize the layout for a premium dark-mode TradingView feel
     fig.update_layout(
